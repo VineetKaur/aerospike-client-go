@@ -3,9 +3,8 @@ name: Connection liveness probe
 on:
   workflow_dispatch:
   push:
-    paths:
-      - connection_liveness*.go
-      - .github/workflows/connection-liveness.yaml
+    branches:
+      - CLIENT-5896-discard-dead-pooled-connections-stage
 
 permissions:
   contents: read
