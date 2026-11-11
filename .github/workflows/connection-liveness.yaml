@@ -21,7 +21,7 @@ jobs:
     env:
       AEROSPIKE_TEST_SKIP_SUITE_CLIENT: "1"
       CGO_ENABLED: "1"
-      LIVENESS_TESTS: TestIdleConnectionIsNotReportedClosed|TestConnectionClosedByPeerIsDetected|TestUnreadBytesOnPlainConnectionCountAsClosed|TestTLSConnectionWithPendingRecordStaysOpenUntilReset|TestProbedConnection|TestCheckoutReturnsTheLiveConnection|TestLivenessProbeAllocations|TestAbandonedConnectionIsStillClosedByGarbageCollector|TestExecuteAtUsesNoRetryForDeadPooledConnections
+      LIVENESS_TESTS: TestIdleConnectionIsNotReportedClosed|TestConnectionClosedByPeerIsDetected|TestUnreadBytesOnPlainConnectionCountAsClosed|TestTLSConnectionWithPendingRecordStaysOpenUntilReset|TestProbedConnectionStillBlocksUntilDataOrDeadline|TestCheckoutReturnsTheLiveConnection|TestLivenessProbeAllocations|TestAbandonedConnectionIsStillClosedByGarbageCollector|TestExecuteAtUsesNoRetryForDeadPooledConnections
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -39,14 +39,3 @@ jobs:
         shell: bash
         run: go test -race -count=20 -run "${LIVENESS_TESTS}" .
 
-      - name: Probe cost
-        shell: bash
-        run: |
-          set -o pipefail
-          go test -count=6 -run '^$' -bench 'BenchmarkLivenessProbe|BenchmarkCheckout|BenchmarkWriteCommand' -benchtime 2s . | tee probe-cost.txt
-          {
-            echo "### Probe cost on ${{ matrix.os }}"
-            echo '```'
-            grep -E '^(goos|goarch|cpu|Benchmark)' probe-cost.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"

@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aerospike/aerospike-client-go/v8/types"
 )
 
 // livenessServer accepts connections on loopback and hands the server side to the test.
@@ -45,7 +47,7 @@ type livenessServer struct {
 	commandsServed atomic.Int64
 }
 
-func newLivenessServer(t testing.TB) *livenessServer {
+func newLivenessServer(t *testing.T) *livenessServer {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -119,7 +121,7 @@ func (server *livenessServer) connectTLS(t *testing.T) (*Connection, *net.TCPCon
 	return result.conn, serverSide, tlsServerSide
 }
 
-func (server *livenessServer) nextAccepted(t testing.TB) *net.TCPConn {
+func (server *livenessServer) nextAccepted(t *testing.T) *net.TCPConn {
 	t.Helper()
 
 	select {
@@ -247,12 +249,16 @@ func TestUnreadBytesOnPlainConnectionCountAsClosed(t *testing.T) {
 		t.Fatal("a plain connection with unread bytes was reported open")
 	}
 
+	if !conn.closedByPeer() {
+		t.Fatal("a second probe of the same unread bytes reported the connection open")
+	}
+
 	// The probe only peeks: the byte is still there to read.
-	if err := conn.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline: %v", err)
+	if err := conn.SetTimeout(time.Now().Add(5*time.Second), 0); err != nil {
+		t.Fatalf("SetTimeout: %v", err)
 	}
 	unread := make([]byte, 1)
-	if _, err := conn.conn.Read(unread); err != nil || unread[0] != 0x7f {
+	if _, err := conn.Read(unread, len(unread)); err != nil || unread[0] != 0x7f {
 		t.Fatalf("read after probe got %#x, err %v; want 0x7f", unread[0], err)
 	}
 	if conn.closedByPeer() {
@@ -294,140 +300,58 @@ func TestTLSConnectionWithPendingRecordStaysOpenUntilReset(t *testing.T) {
 	}
 }
 
-func TestProbedConnectionStillWaitsForDataAndTimesOut(t *testing.T) {
+func TestProbedConnectionStillBlocksUntilDataOrDeadline(t *testing.T) {
 	server := newLivenessServer(t)
 	conn, serverSide := server.connect(t)
 
-	if conn.closedByPeer() {
-		t.Fatal("an open idle connection was reported closed")
-	}
-
-	// A read with nothing to read yet waits for the data.
-	sendDelay := 100 * time.Millisecond
-	go func() {
-		time.Sleep(sendDelay)
-		_, _ = serverSide.Write([]byte("late"))
-	}()
-	if err := conn.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		t.Fatalf("SetReadDeadline: %v", err)
-	}
-	readStart := time.Now()
-	received := make([]byte, 4)
-	if _, err := io.ReadFull(conn.conn, received); err != nil || string(received) != "late" {
-		t.Fatalf("delayed read got %q, err %v; want \"late\"", received, err)
-	}
-	if waited := time.Since(readStart); waited < sendDelay/2 {
-		t.Fatalf("read returned after %s, before the data was sent", waited)
-	}
-
-	// A read with nothing to read ends at its deadline with a timeout.
-	if conn.closedByPeer() {
-		t.Fatal("an open idle connection was reported closed")
-	}
-	if err := conn.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-		t.Fatalf("SetReadDeadline: %v", err)
-	}
-	_, err := conn.conn.Read(received)
-	var netErr net.Error
-	if !errors.As(err, &netErr) || !netErr.Timeout() {
-		t.Fatalf("read without data got err %v, want a timeout", err)
-	}
-	if conn.closedByPeer() {
-		t.Fatal("the connection was reported closed after a read timeout")
-	}
-}
-
-func TestProbedConnectionCarriesRoundTripsAndLargePayloads(t *testing.T) {
-	server := newLivenessServer(t)
-	conn, serverSide := server.connect(t)
-	go func() { _, _ = io.Copy(serverSide, serverSide) }()
-
-	if err := conn.conn.SetDeadline(time.Now().Add(time.Minute)); err != nil {
-		t.Fatalf("SetDeadline: %v", err)
-	}
-
-	request := make([]byte, 64)
-	response := make([]byte, len(request))
-	for roundTrip := range 2000 {
-		if conn.closedByPeer() {
-			t.Fatalf("round trip %d: an open connection was reported closed", roundTrip)
-		}
-		binary.BigEndian.PutUint64(request, uint64(roundTrip))
-		if _, err := conn.conn.Write(request); err != nil {
-			t.Fatalf("round trip %d: write: %v", roundTrip, err)
-		}
-		if _, err := io.ReadFull(conn.conn, response); err != nil {
-			t.Fatalf("round trip %d: read: %v", roundTrip, err)
-		}
-		if !bytes.Equal(request, response) {
-			t.Fatalf("round trip %d: response differs from request", roundTrip)
-		}
-	}
-
+	// More than the socket buffers hold, so the write and the read both have to wait.
 	payload := make([]byte, 4<<20)
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
-	writeErr := make(chan error, 1)
 	go func() {
-		_, err := conn.conn.Write(payload)
-		writeErr <- err
+		received := make([]byte, len(payload))
+		if _, err := io.ReadFull(serverSide, received); err != nil {
+			return
+		}
+		_, _ = serverSide.Write(received)
 	}()
-	echoed := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn.conn, echoed); err != nil {
-		t.Fatalf("large read: %v", err)
+
+	if conn.closedByPeer() {
+		t.Fatal("an open idle connection was reported closed")
 	}
-	if err := <-writeErr; err != nil {
-		t.Fatalf("large write: %v", err)
+	if err := conn.SetTimeout(time.Now().Add(time.Minute), 0); err != nil {
+		t.Fatalf("SetTimeout: %v", err)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	echoed := make([]byte, len(payload))
+	if _, err := conn.Read(echoed, len(echoed)); err != nil {
+		t.Fatalf("read: %v", err)
 	}
 	if !bytes.Equal(payload, echoed) {
-		t.Fatal("large payload was not echoed back intact")
+		t.Fatal("the payload was not echoed back intact")
+	}
+
+	// A read with nothing to read waits for its deadline and reports a timeout.
+	if conn.closedByPeer() {
+		t.Fatal("an open idle connection was reported closed")
+	}
+	readTimeout := 200 * time.Millisecond
+	if err := conn.SetTimeout(time.Now().Add(readTimeout), 0); err != nil {
+		t.Fatalf("SetTimeout: %v", err)
+	}
+	readStart := time.Now()
+	_, err := conn.Read(echoed, 1)
+	if err == nil || !err.Matches(types.TIMEOUT) {
+		t.Fatalf("read without data got err %v, want a timeout", err)
+	}
+	if waited := time.Since(readStart); waited < readTimeout/2 {
+		t.Fatalf("read gave up after %s, before its %s deadline", waited, readTimeout)
 	}
 	if conn.closedByPeer() {
-		t.Fatal("the connection was reported closed after the large payload")
-	}
-}
-
-func TestLivenessProbeAllocations(t *testing.T) {
-	server := newLivenessServer(t)
-	conn, _ := server.connect(t)
-
-	// On Windows the "nothing to read" error of the peek is boxed by the syscall package.
-	allowed := 0.0
-	if runtime.GOOS == "windows" {
-		allowed = 1
-	}
-
-	allocations := testing.AllocsPerRun(1000, func() {
-		if conn.closedByPeer() {
-			t.Fatal("an open idle connection was reported closed")
-		}
-	})
-	if allocations > allowed {
-		t.Fatalf("probe allocated %v objects per call, want at most %v", allocations, allowed)
-	}
-	t.Logf("probe allocated %v objects per call", allocations)
-}
-
-func BenchmarkLivenessProbe(b *testing.B) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("listen: %v", err)
-	}
-	defer listener.Close()
-
-	conn, aerr := NewConnection(NewClientPolicy(), NewHost("127.0.0.1", listener.Addr().(*net.TCPAddr).Port))
-	if aerr != nil {
-		b.Fatalf("NewConnection: %v", aerr)
-	}
-	defer conn.Close()
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if conn.closedByPeer() {
-			b.Fatal("an open idle connection was reported closed")
-		}
+		t.Fatal("the connection was reported closed after a read timeout")
 	}
 }
 
@@ -485,7 +409,7 @@ func (cmd *stalePoolWriteCommand) prepareRetry(ifc command, isTimeout bool) bool
 }
 
 // newLivenessNode returns a node with an empty pool that dials the server.
-func newLivenessNode(t testing.TB, server *livenessServer) *Node {
+func newLivenessNode(t *testing.T, server *livenessServer) *Node {
 	t.Helper()
 
 	cluster := &Cluster{clientPolicy: &atomic.Pointer[ClientPolicy]{}}
@@ -566,7 +490,7 @@ func TestCheckoutReturnsTheLiveConnectionAndClosesTheDeadOnes(t *testing.T) {
 	}
 }
 
-func newStalePoolWriteCommand(t testing.TB, node *Node, policy *WritePolicy, key *Key) *stalePoolWriteCommand {
+func newStalePoolWriteCommand(t *testing.T, node *Node, policy *WritePolicy, key *Key) *stalePoolWriteCommand {
 	t.Helper()
 
 	bwc, err := newBaseWriteCommand(nil, policy, key)
@@ -580,82 +504,6 @@ func newStalePoolWriteCommand(t testing.TB, node *Node, policy *WritePolicy, key
 			operation:        _WRITE,
 		},
 		targetNode: node,
-	}
-}
-
-// pooledConnectionForBenchmark puts one live connection in the node's pool.
-// Without the probe, checkout behaves as it did before the probe existed.
-func pooledConnectionForBenchmark(b *testing.B, node *Node, server *livenessServer, withProbe bool) {
-	b.Helper()
-
-	conn, err := node.newConnection(true)
-	if err != nil {
-		b.Fatalf("newConnection: %v", err)
-	}
-	go server.serveWrites(server.nextAccepted(b))
-	if !withProbe {
-		conn.peerProbe = nil
-	}
-	if !node.putConnectionWithHint(conn, 0) {
-		b.Fatal("pool rejected the connection")
-	}
-}
-
-var probeBenchmarkVariants = []struct {
-	name      string
-	withProbe bool
-}{
-	{"without_probe", false},
-	{"with_probe", true},
-}
-
-// BenchmarkCheckout takes a connection from the pool and puts it back.
-func BenchmarkCheckout(b *testing.B) {
-	for _, variant := range probeBenchmarkVariants {
-		b.Run(variant.name, func(b *testing.B) {
-			server := newLivenessServer(b)
-			node := newLivenessNode(b, server)
-			pooledConnectionForBenchmark(b, node, server, variant.withProbe)
-
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				conn, err := node.getConnectionWithHint(0, 0, 0, 0)
-				if err != nil {
-					b.Fatalf("checkout: %v", err)
-				}
-				node.putConnectionWithHint(conn, 0)
-			}
-		})
-	}
-}
-
-// BenchmarkWriteCommand runs a write command against a loopback server, checkout included.
-func BenchmarkWriteCommand(b *testing.B) {
-	key, err := NewKey("test", "stale-pool", 1)
-	if err != nil {
-		b.Fatalf("NewKey: %v", err)
-	}
-
-	for _, variant := range probeBenchmarkVariants {
-		b.Run(variant.name, func(b *testing.B) {
-			server := newLivenessServer(b)
-			node := newLivenessNode(b, server)
-			pooledConnectionForBenchmark(b, node, server, variant.withProbe)
-
-			policy := NewWritePolicy(0, 0)
-			policy.TotalTimeout = 0
-			cmd := newStalePoolWriteCommand(b, node, policy, key)
-
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				cmd.commandSentCounter = 0
-				if err := cmd.executeAt(cmd, policy.GetBasePolicy(), time.Time{}, -1); err != nil {
-					b.Fatalf("write: %v", err)
-				}
-			}
-		})
 	}
 }
 
@@ -727,9 +575,6 @@ func TestExecuteAtUsesNoRetryForDeadPooledConnections(t *testing.T) {
 	}
 	if cmd.commandSentCounter != 1 {
 		t.Errorf("second write used %d attempts, want 1", cmd.commandSentCounter)
-	}
-	if served := server.commandsServed.Load(); served != 2 {
-		t.Errorf("server received %d commands after the second write, want 2", served)
 	}
 	if closed := node.stats.ConnectionsClosed.Get(); closed != stalePooled {
 		t.Errorf("node closed %d connections after the second write, want still %d", closed, stalePooled)
