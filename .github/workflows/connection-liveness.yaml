@@ -39,3 +39,88 @@ jobs:
         shell: bash
         run: go test -race -count=20 -run "${LIVENESS_TESTS}" .
 
+  # Full suite on a self-hosted Windows runner; the server runs on its paired Linux VM.
+  windows-suite:
+    name: windows full suite
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install a C compiler for the race detector
+        shell: pwsh
+        run: |
+          choco install mingw --yes --no-progress
+          echo "C:\ProgramData\mingw64\mingw64\bin" >> $env:GITHUB_PATH
+
+      - name: Verify Docker (Linux daemon)
+        shell: pwsh
+        run: |
+          $os = docker info --format '{{.OSType}}'
+          if ($os -ne 'linux') { Write-Error "Expected Linux daemon, got: $os"; exit 1 }
+
+      - name: Resolve Aerospike host
+        shell: pwsh
+        run: |
+          $h = $env:DOCKER_HOST -replace '^tcp://','' -replace ':\d+$',''
+          echo "AEROSPIKE_HOST=$h" >> $env:GITHUB_ENV
+
+      - name: Start Aerospike server
+        id: setup-aerospike
+        uses: aerospike/shared-workflows/.github/actions/setup-aerospike-server@308f37e0cd5c7a6386a99ea7afc379d5a4ea9256 # v5.1.0
+        with:
+          server-tag: 8.1.2.0
+          num-nodes: 1
+          features-content: ${{ secrets.FEATURES_CONF }}
+          oidc-provider: ${{ vars.OIDC_PROVIDER }}
+          oidc-audience: ${{ vars.OIDC_AUDIENCE }}
+
+      - name: Run the suite
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+          go run github.com/onsi/ginkgo/v2/ginkgo -race -v -keep-going -skip="HyperLogLog" `
+            -output-dir=reports -junit-report=windows-junit.xml `
+            -coverprofile=covprofile_windows.out -covermode=atomic -coverpkg=./... `
+            -- -h $env:AEROSPIKE_HOST -p 3000 2>&1 | Tee-Object -FilePath reports/windows-test.log
+          $code = $LASTEXITCODE
+          exit $code
+
+      - name: Coverage report
+        if: always()
+        shell: pwsh
+        run: |
+          go tool cover -html reports/covprofile_windows.out -o reports/coverage.html
+          go tool cover -func reports/covprofile_windows.out | Select-Object -Last 1 >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Save the server log
+        if: always()
+        shell: pwsh
+        run: docker logs aerospike-1 > reports/aerospike-server.log 2>&1
+
+      - name: Upload report, coverage and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-suite-report
+          path: reports/
+
+      - name: Stop Aerospike server
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($c in "${{ steps.setup-aerospike.outputs.container-names }}".Split(',')) {
+            docker rm -f $c.Trim() 2>$null
+          }
+          docker network rm "${{ steps.setup-aerospike.outputs.network-name }}" 2>$null; exit 0
