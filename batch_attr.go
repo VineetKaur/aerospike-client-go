@@ -64,8 +64,9 @@ func newBatchAttrOps(rp *BatchPolicy, wp *BatchWritePolicy, ops []*Operation) *b
 			readHeader = true
 			hasRead = true
 		case _BIT_READ, _EXP_READ, _HLL_READ, _MAP_READ, _CDT_READ, _READ:
-			// _Read all bins if no bin is specified.
-			if op.binName == "" {
+			// Read all bins if no bin is specified. Only a plain read can mean
+			// "all bins"; see newOperateArgs.
+			if op.opType == _READ && op.binName == "" {
 				readAllBins = true
 			}
 			hasRead = true
@@ -238,8 +239,9 @@ func (ba *batchAttr) adjustWrite(ops []*Operation) {
 			readHeader = true
 			hasRead = true
 		case _BIT_READ, _EXP_READ, _HLL_READ, _MAP_READ, _CDT_READ, _READ:
-			// _Read all bins if no bin is specified.
-			if op.binName == "" {
+			// Read all bins if no bin is specified. Only a plain read can mean
+			// "all bins"; see newOperateArgs.
+			if op.opType == _READ && op.binName == "" {
 				readAllBins = true
 			}
 			hasRead = true

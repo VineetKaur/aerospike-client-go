@@ -54,8 +54,12 @@ func newOperateArgs(
 		case _CDT_READ, _READ:
 			rattr |= _INFO1_READ
 
-			// Read all bins if no bin is specified.
-			if len(operation.binName) == 0 {
+			// Read all bins if no bin is specified. Only a plain read can mean
+			// "all bins": "" is also a valid bin name, and the server ignores
+			// the operation list when GET_ALL is set, so setting it for a CDT,
+			// bit, HLL or expression read on bin "" would silently return
+			// every bin whole instead of the operation's result.
+			if operation.opType == _READ && len(operation.binName) == 0 {
 				rattr |= _INFO1_GET_ALL
 			}
 			readBin = true
