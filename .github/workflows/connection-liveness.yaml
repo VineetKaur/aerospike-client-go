@@ -90,9 +90,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
-          go run github.com/onsi/ginkgo/v2/ginkgo -race -v -keep-going -skip="HyperLogLog" `
-            -output-dir=reports -junit-report=windows-junit.xml `
-            -coverprofile=covprofile_windows.out -covermode=atomic -coverpkg=./... `
+          # Quoted because PowerShell splits an unquoted -flag=value at a period.
+          go run github.com/onsi/ginkgo/v2/ginkgo -race -v -keep-going "-skip=HyperLogLog" `
+            "-output-dir=reports" "-junit-report=windows-junit.xml" `
+            "-coverprofile=covprofile_windows.out" "-covermode=atomic" "-coverpkg=./..." `
             -- -h $env:AEROSPIKE_HOST -p 3000 2>&1 | Tee-Object -FilePath reports/windows-test.log
           $code = $LASTEXITCODE
           exit $code
@@ -101,6 +102,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          if (-not (Test-Path reports/covprofile_windows.out)) { Write-Host "No coverage profile was produced"; exit 0 }
           go tool cover -html reports/covprofile_windows.out -o reports/coverage.html
           go tool cover -func reports/covprofile_windows.out | Select-Object -Last 1 >> $env:GITHUB_STEP_SUMMARY
 
